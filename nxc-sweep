@@ -1,0 +1,86 @@
+#!/bin/bash
+
+# --- Colors ---
+BLUE='\033[0;34m'
+YELLOW='\033[38;5;226m'
+GREEN='\033[0;32m'
+GREY='\033[38;5;244m'
+
+
+# --- Help Menu ---
+usage() {
+    echo -e "${YELLOW}Usage: nxc-sweep <IP> -u <username> -p <password> [global flags]"
+    exit 1
+}
+
+
+# pulls IP first like in native nxc syntax
+if [[ -z "$1" || "$1" == -* ]]; then
+    usage
+fi
+
+TARGET=$1
+shift # shifts arguments over so $2 becomes $1, etc.
+
+# parses the remaining flags (-u, -p, and anything else like --local-auth)
+GLOBAL_FLAGS=()
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -u) USER=$2; shift 2 ;;
+        -p) PASS=$2; shift 2 ;;
+        *) GLOBAL_FLAGS+=("$1"); shift 1 ;;
+    esac
+done
+
+
+# validation check
+if [[ -z "$TARGET" || -z "$USER" || -z "$PASS" ]]; then
+    usage
+fi
+
+echo -e "${BLUE}[*] Starting NXC sweep for $TARGET as $USER ...\n"
+
+# --- Protocol Handler ---
+check_and_run() {
+    local PORT=$1
+    local PROTO=$2
+    shift 2 
+
+    # checks if the port is open before running NXC to save time
+    if nc -z -w 1 "$TARGET" "$PORT" 2>/dev/null; then
+        echo -e "${GREEN}[+] Port $PORT open. Checking ${PROTO} ..."
+        
+        local EXTRA_FLAGS=("$@")
+        local SAFE_GLOBAL_FLAGS=()
+
+        # filters out --local-auth for FTP to prevent crashes
+        for flag in "${GLOBAL_FLAGS[@]}"; do
+            if [[ "$PROTO" == "ftp" && "$flag" == "--local-auth" ]]; then
+                continue # Skip this specific flag
+            fi
+            SAFE_GLOBAL_FLAGS+=("$flag")
+        done
+
+        # run normally for everything to preserve native NXC colors
+        nxc "$PROTO" "$TARGET" -u "$USER" -p "$PASS" "${SAFE_GLOBAL_FLAGS[@]}" "${EXTRA_FLAGS[@]}"
+
+    else
+        echo -e "${GREY}[-] Port $PORT closed/filtered. Skipping ${PROTO}"
+    fi
+    echo ""
+}
+
+# --- Protocols ---
+check_and_run 445 "smb" "--shares"
+check_and_run 5985 "winrm"
+check_and_run 3389 "rdp"
+check_and_run 1433 "mssql" -q "SELECT name FROM master.sys.databases;"
+check_and_run 21 "ftp" "--ls"
+check_and_run 389 "ldap" "--users"
+check_and_run 22 "ssh"
+check_and_run 135 "wmi"
+check_and_run 5900 "vnc"
+check_and_run 2049 "nfs" "--shares"
+
+
+echo -e "${BLUE}[*] All active services checked."

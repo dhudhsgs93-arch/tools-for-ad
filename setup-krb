@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# Quick KDC setup for AD pentesting
+# Usage: setup-krb <domain> <dc-ip> [dc-hostname]
+# Example: setup-krb hokkaido-aerospace.com 192.168.109.40 dc
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[38;5;226m'
+NC='\033[0m'
+
+if [[ -z "$1" || -z "$2" ]]; then
+    echo -e "${YELLOW}Usage: setup-krb <domain> <dc-ip> [dc-hostname]${NC}"
+    echo -e "  Example: setup-krb hokkaido-aerospace.com 192.168.109.40 dc"
+    exit 1
+fi
+
+DOMAIN=$1
+DC_IP=$2
+DC_HOST=${3:-dc}
+REALM=$(echo "$DOMAIN" | tr '[:lower:]' '[:upper:]')
+DC_FQDN="${DC_HOST}.${DOMAIN}"
+
+echo -e "${GREEN}[+] Setting up Kerberos for ${DOMAIN}${NC}"
+echo -e "    Realm:   ${REALM}"
+echo -e "    KDC:     ${DC_FQDN} (${DC_IP})"
+
+# ── /etc/krb5.conf ──
+sudo tee /etc/krb5.conf > /dev/null <<EOF
+[libdefaults]
+    default_realm = ${REALM}
+    dns_lookup_realm = false
+    dns_lookup_kdc = false
+    ticket_lifetime = 24h
+    renew_lifetime = 7d
+    forwardable = true
+    rdns = false
+    udp_preference_limit = 1
+
+[realms]
+    ${REALM} = {
+        kdc = tcp/${DC_FQDN}:88
+        admin_server = ${DC_FQDN}:464
+        default_domain = ${DOMAIN}
+    }
+
+[domain_realm]
+    .${DOMAIN} = ${REALM}
+    ${DOMAIN} = ${REALM}
+EOF
+
+echo -e "${GREEN}[+] /etc/krb5.conf updated${NC}"
+
+# ── /etc/hosts ──
+if ! grep -q "$DC_FQDN" /etc/hosts 2>/dev/null; then
+    echo "${DC_IP}  ${DC_FQDN} ${DOMAIN} ${DC_HOST}" | sudo tee -a /etc/hosts > /dev/null
+    echo -e "${GREEN}[+] /etc/hosts updated${NC}"
+else
+    echo -e "${YELLOW}[~] /etc/hosts already has ${DC_FQDN}${NC}"
+fi
+
+# ── Verify ──
+echo -e "\n${GREEN}[+] Testing KDC connectivity...${NC}"
+if nc -z -w 2 "$DC_IP" 88 2>/dev/null; then
+    echo -e "${GREEN}[+] Port 88 (Kerberos) open${NC}"
+else
+    echo -e "${RED}[-] Port 88 closed — check connectivity${NC}"
+fi
+
+echo -e "\n${GREEN}[+] Done. You can now use:${NC}"
+echo -e "    kinit user@${REALM}"
+echo -e "    xfreerdp /v:${DC_IP} /u:user /d:${DOMAIN} ..."
+echo -e "    impacket-* ${DOMAIN}/user:pass@${DC_IP} -k"
