@@ -9,7 +9,10 @@ GREY='\033[38;5;244m'
 
 # --- Help Menu ---
 usage() {
-    echo -e "${YELLOW}Usage: nxc-sweep <IP> -u <username> -p <password> [global flags]"
+    echo -e "${YELLOW}Usage: nxc-sweep <IP> [-u <username>] [-p <password>] [global flags]"
+    echo -e "${GREY}       Empty/omitted -u/-p => null session (anonymous), e.g.:"
+    echo -e "${GREY}         nxc-sweep 10.10.10.5 -u '' -p ''"
+    echo -e "${GREY}         nxc-sweep 10.10.10.5"
     exit 1
 }
 
@@ -23,6 +26,9 @@ TARGET=$1
 shift # shifts arguments over so $2 becomes $1, etc.
 
 # parses the remaining flags (-u, -p, and anything else like --local-auth)
+# USER/PASS default to "" so an omitted flag behaves like a null session
+USER=""
+PASS=""
 GLOBAL_FLAGS=()
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -33,12 +39,15 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 
-# validation check
-if [[ -z "$TARGET" || -z "$USER" || -z "$PASS" ]]; then
+# validation: only the target is mandatory. Empty -u/-p == null session.
+if [[ -z "$TARGET" ]]; then
     usage
 fi
 
-echo -e "${BLUE}[*] Starting NXC sweep for $TARGET as $USER ...\n"
+DISPLAY_USER="$USER"
+[[ -z "$USER" && -z "$PASS" ]] && DISPLAY_USER="<null session>"
+
+echo -e "${BLUE}[*] Starting NXC sweep for $TARGET as $DISPLAY_USER ...\n"
 
 # --- Protocol Handler ---
 check_and_run() {
