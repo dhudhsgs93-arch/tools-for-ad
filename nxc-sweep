@@ -9,10 +9,13 @@ GREY='\033[38;5;244m'
 
 # --- Help Menu ---
 usage() {
-    echo -e "${YELLOW}Usage: nxc-sweep <IP> [-u <username>] [-p <password>] [global flags]"
+    echo -e "${YELLOW}Usage: nxc-sweep <IP> [-u <username>] [-p <password>] [--no-vulns|--vulns-only] [global flags]"
     echo -e "${GREY}       Empty/omitted -u/-p => null session (anonymous), e.g.:"
     echo -e "${GREY}         nxc-sweep 10.10.10.5 -u '' -p ''"
     echo -e "${GREY}         nxc-sweep 10.10.10.5"
+    echo -e "${GREY}       --no-vulns    : protocol sweep only, skip MS17-010 / Zerologon / etc"
+    echo -e "${GREY}       --vulns-only  : skip protocol sweep, run Windows vuln modules only"
+    echo -e "${GREY}       --no-guest    : skip the default SMB guest-account fallback"
     exit 1
 }
 
@@ -29,11 +32,17 @@ shift # shifts arguments over so $2 becomes $1, etc.
 # USER/PASS default to "" so an omitted flag behaves like a null session
 USER=""
 PASS=""
+RUN_VULNS=1          # run Windows vuln modules on SMB by default
+VULNS_ONLY=0         # skip the protocol sweep, only run vuln modules
+RUN_GUEST=1          # also try the SMB guest account by default (null-session fallback)
 GLOBAL_FLAGS=()
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -u) USER=$2; shift 2 ;;
         -p) PASS=$2; shift 2 ;;
+        --no-vulns) RUN_VULNS=0; shift 1 ;;
+        --vulns-only) VULNS_ONLY=1; shift 1 ;;
+        --no-guest) RUN_GUEST=0; shift 1 ;;
         *) GLOBAL_FLAGS+=("$1"); shift 1 ;;
     esac
 done
@@ -79,17 +88,73 @@ check_and_run() {
     echo ""
 }
 
-# --- Protocols ---
-check_and_run 445 "smb" "--shares"
-check_and_run 5985 "winrm"
-check_and_run 3389 "rdp"
-check_and_run 1433 "mssql" -q "SELECT name FROM master.sys.databases;"
-check_and_run 21 "ftp" "--ls"
-check_and_run 389 "ldap" "--users"
-check_and_run 22 "ssh"
-check_and_run 135 "wmi"
-check_and_run 5900 "vnc"
-check_and_run 2049 "nfs" "--shares"
+# --- SMB guest fallback ---
+# A true null session (-u '') is frequently refused for share enumeration on
+# modern/hardened Windows (STATUS_ACCESS_DENIED + conn reset 104), while the
+# guest account mapped to a blank password still lists shares. Run it by
+# default unless the caller is already authenticating as guest.
+check_smb_guest() {
+    [[ "${USER,,}" == "guest" ]] && return
+    if nc -z -w 1 "$TARGET" 445 2>/dev/null; then
+        echo -e "${GREEN}[+] SMB guest fallback (-u guest -p '') ..."
+        nxc smb "$TARGET" -u "guest" -p "" "${GLOBAL_FLAGS[@]}" --shares
+        echo ""
+    fi
+}
 
+# --- Windows vuln sweep (SMB modules) ---
+# ms17-010 / smbghost work unauthenticated; the DC-side checks (zerologon,
+# nopac, printnightmare, coerce_plus) run anonymously too but may need creds
+# on hardened DCs. spooler/webdav are coercion-relay prerequisites.
+run_vulns() {
+    if ! nc -z -w 1 "$TARGET" 445 2>/dev/null; then
+        echo -e "${GREY}[-] Port 445 closed/filtered. Skipping Windows vuln checks"
+        echo ""
+        return
+    fi
+
+    echo -e "${GREEN}[+] Port 445 open. Running Windows vuln modules ...\n"
+
+    # module list: name -> printed comment
+    local MODULES=(
+        "ms17-010|EternalBlue (CVE-2017-0144)"
+        "smbghost|SMBGhost / CVE-2020-0796 (SMBv3.1.1 compression)"
+        "zerologon|Zerologon / CVE-2020-1472 (DC)"
+        "nopac|noPac / CVE-2021-42278+42287 (DC)"
+        "printnightmare|PrintNightmare / CVE-2021-1675/34527"
+        "coerce_plus|Coerce (PetitPotam/DFSCoerce/ShadowCoerce/PrinterBug)"
+        "spooler|Print Spooler enabled (PrinterBug relay prereq)"
+        "webdav|WebClient/WebDAV running (relay prereq)"
+    )
+
+    for entry in "${MODULES[@]}"; do
+        local MOD="${entry%%|*}"
+        local DESC="${entry#*|}"
+        echo -e "${BLUE}[*] ${MOD} — ${DESC}"
+        nxc smb "$TARGET" -u "$USER" -p "$PASS" "${GLOBAL_FLAGS[@]}" -M "$MOD"
+        echo ""
+    done
+}
+
+# --- Protocols ---
+if [[ "$VULNS_ONLY" -eq 0 ]]; then
+    check_and_run 445 "smb" "--shares"
+    [[ "$RUN_GUEST" -eq 1 ]] && check_smb_guest
+    check_and_run 5985 "winrm"
+    check_and_run 3389 "rdp"
+    check_and_run 1433 "mssql" -q "SELECT name FROM master.sys.databases;"
+    check_and_run 21 "ftp" "--ls"
+    check_and_run 389 "ldap" "--users"
+    check_and_run 22 "ssh"
+    check_and_run 135 "wmi"
+    check_and_run 5900 "vnc"
+    check_and_run 2049 "nfs" "--shares"
+fi
+
+# --- Windows vuln modules ---
+if [[ "$RUN_VULNS" -eq 1 || "$VULNS_ONLY" -eq 1 ]]; then
+    echo -e "${BLUE}[*] --- Windows vulnerability checks ---\n"
+    run_vulns
+fi
 
 echo -e "${BLUE}[*] All active services checked."
