@@ -54,6 +54,13 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
+# When an NTLM hash is supplied via -H, do not also send an empty -p "":
+# that produces a spurious STATUS_LOGON_FAILURE before the real hash attempt.
+HAS_HASH=0
+for g in "${GLOBAL_FLAGS[@]}"; do
+    [[ "$g" == "-H" || "$g" == "--hash" ]] && HAS_HASH=1
+done
+
 
 # validation: only the target is mandatory. Empty -u/-p == null session.
 if [[ -z "$TARGET" ]]; then
@@ -86,8 +93,12 @@ check_and_run() {
             SAFE_GLOBAL_FLAGS+=("$flag")
         done
 
+        # credentials: -u always; -p only when no hash is being used
+        local AUTH_FLAGS=(-u "$USER")
+        [[ "$HAS_HASH" -eq 0 ]] && AUTH_FLAGS+=(-p "$PASS")
+
         # run normally for everything to preserve native NXC colors
-        nxc "$PROTO" "$TARGET" -u "$USER" -p "$PASS" "${SAFE_GLOBAL_FLAGS[@]}" "${EXTRA_FLAGS[@]}"
+        nxc "$PROTO" "$TARGET" "${AUTH_FLAGS[@]}" "${SAFE_GLOBAL_FLAGS[@]}" "${EXTRA_FLAGS[@]}"
 
     else
         echo -e "${GREY}[-] Port $PORT closed/filtered. Skipping ${PROTO}"
@@ -103,8 +114,24 @@ check_and_run() {
 check_smb_guest() {
     [[ "${USER,,}" == "guest" ]] && return
     if nc -z -w 1 "$TARGET" 445 2>/dev/null; then
+        # guest fallback is a clean blank-password probe: drop any operator
+        # NTLM hash (-H/--hash) and its value so it is not tried as guest.
+        local GUEST_FLAGS=()
+        local skip=0
+        for flag in "${GLOBAL_FLAGS[@]}"; do
+            if [[ "$skip" -eq 1 ]]; then
+                skip=0
+                continue
+            fi
+            if [[ "$flag" == "-H" || "$flag" == "--hash" ]]; then
+                skip=1
+                continue
+            fi
+            GUEST_FLAGS+=("$flag")
+        done
+
         echo -e "${GREEN}[+] SMB guest fallback (-u guest -p '') ..."
-        nxc smb "$TARGET" -u "guest" -p "" "${GLOBAL_FLAGS[@]}" --shares
+        nxc smb "$TARGET" -u "guest" -p "" "${GUEST_FLAGS[@]}" --shares
         echo ""
     fi
 }
@@ -134,11 +161,14 @@ run_vulns() {
         "webdav|WebClient/WebDAV running (relay prereq)"
     )
 
+    local AUTH_FLAGS=(-u "$USER")
+    [[ "$HAS_HASH" -eq 0 ]] && AUTH_FLAGS+=(-p "$PASS")
+
     for entry in "${MODULES[@]}"; do
         local MOD="${entry%%|*}"
         local DESC="${entry#*|}"
         echo -e "${BLUE}[*] ${MOD} — ${DESC}"
-        nxc smb "$TARGET" -u "$USER" -p "$PASS" "${GLOBAL_FLAGS[@]}" -M "$MOD"
+        nxc smb "$TARGET" "${AUTH_FLAGS[@]}" "${GLOBAL_FLAGS[@]}" -M "$MOD"
         echo ""
     done
 }
