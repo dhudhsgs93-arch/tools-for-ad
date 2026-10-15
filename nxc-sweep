@@ -85,10 +85,16 @@ check_and_run() {
         local EXTRA_FLAGS=("$@")
         local SAFE_GLOBAL_FLAGS=()
 
-        # filters out --local-auth for FTP to prevent crashes
+        # nxc parses --local-auth only for SMB, WinRM, MSSQL, WMI and RDP;
+        # strip it from the other protocols so nxc doesn't die on the flag.
+        # This keeps behavior 1:1 with nxc: we never invent a domain or auth.
+        local LOCAL_AUTH_OK=0
+        case "$PROTO" in
+            smb|winrm|mssql|wmi|rdp) LOCAL_AUTH_OK=1 ;;
+        esac
         for flag in "${GLOBAL_FLAGS[@]}"; do
-            if [[ "$PROTO" == "ftp" && "$flag" == "--local-auth" ]]; then
-                continue # Skip this specific flag
+            if [[ "$LOCAL_AUTH_OK" -eq 0 && "$flag" == "--local-auth" ]]; then
+                continue # skip this specific flag
             fi
             SAFE_GLOBAL_FLAGS+=("$flag")
         done
